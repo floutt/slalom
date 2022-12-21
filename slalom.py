@@ -111,12 +111,13 @@ def main(args):
     ht_snp = ht_snp.key_by("locus", "alleles")
     ht_snp = ht_snp.add_index("idx_snp")
 
-    # annotate in novel CUPs and reject
-    cup = hl.read_table(f"gs://finucane-requester-pays/slalom/cup_files/FASTA_BED.ALL_{reference_genome}.novel_CUPs.ht")
-    reject = hl.read_table(
-        f"gs://finucane-requester-pays/slalom/cup_files/FASTA_BED.ALL_{reference_genome}.reject_2.ht"
-    )
-    ht_snp = ht_snp.annotate(in_cups=hl.is_defined(cup[ht_snp.locus]) | hl.is_defined(reject[ht_snp.locus]))
+    # annotate in novel CUPs and reject if using GNOMAD 
+    if(args.ld_reference == "gnomad"):
+        cup = hl.read_table(f"gs://finucane-requester-pays/slalom/cup_files/FASTA_BED.ALL_{reference_genome}.novel_CUPs.ht")
+        reject = hl.read_table(
+            f"gs://finucane-requester-pays/slalom/cup_files/FASTA_BED.ALL_{reference_genome}.reject_2.ht"
+        )
+        ht_snp = ht_snp.annotate(in_cups=hl.is_defined(cup[ht_snp.locus]) | hl.is_defined(reject[ht_snp.locus]))
 
     # annotate vep and freq
     if args.annotate_consequence or args.annotate_gnomad_freq:
@@ -134,7 +135,7 @@ def main(args):
     df = ht_snp.key_by().drop("locus", "alleles", "idx_snp").to_pandas()
 
     if args.abf:
-        lbf, prob = abf(df.beta, df.se, W=args.abf_prior_variance)
+        lbf, prob = abf(df.beta.astype(np.float64), df.se.astype(np.float64), W=args.abf_prior_variance)
         cs = get_cs(df.variant, prob, coverage=0.95)
         cs_99 = get_cs(df.variant, prob, coverage=0.99)
         df["lbf"] = lbf
@@ -245,7 +246,7 @@ def main(args):
         df["t_dentist_s"] = ((df.beta / df.se) - df.r * lead_z) ** 2 / (1 - df.r ** 2)
         df["t_dentist_s"] = np.where(df["t_dentist_s"] < 0, np.inf, df["t_dentist_s"])
         df["t_dentist_s"].iloc[lead_idx_snp] = np.nan
-        df["nlog10p_dentist_s"] = sp.stats.chi2.logsf(df["t_dentist_s"], df=1) / -np.log(10)
+        df["nlog10p_dentist_s"] = sp.stats.chi2.logsf(df["t_dentist_s"].astype(np.float64), df=1) / -np.log(10)
 
     if args.out.startswith("gs://"):
         fopen = hl.hadoop_open
