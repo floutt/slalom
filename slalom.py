@@ -96,12 +96,13 @@ def main(args):
     gnomad_version = gnomad_latest_versions[reference_genome]
     gnomad_ht_path = f"gs://finucane-requester-pays/slalom/gnomad/release/{gnomad_version}/ht/genomes/gnomad.genomes.r{gnomad_version}.sites.most_severe.ht"
 
-    ht_snp = hl.import_table(args.snp, impute=True, types={"chromosome": hl.tstr}, delimiter="\s+")
+    chr_str = hl.str("chr") if args.add_chr else hl.str("")
+    ht_snp = hl.import_table(args.snp, impute=True, types={args.chromosome_name: hl.tstr}, delimiter="\s+")
     ht_snp = ht_snp.annotate(
         locus=hl.parse_locus(
-            hl.delimit([ht_snp.chromosome, hl.str(ht_snp.position)], delimiter=":"), reference_genome=reference_genome
+            hl.delimit([hl.delimit([chr_str, ht_snp[args.chromosome_name]], delimiter=""), hl.str(ht_snp.position)], delimiter=":"), reference_genome=reference_genome
         ),
-        alleles=[ht_snp.allele1, ht_snp.allele2],
+        alleles=[ht_snp[args.allele1_name], ht_snp[args.allele2_name]],
     )
     if args.align_alleles:
         ht_gnomad = hl.read_table(gnomad_ht_path)
@@ -135,7 +136,7 @@ def main(args):
     df = ht_snp.key_by().drop("locus", "alleles", "idx_snp").to_pandas()
 
     if args.abf:
-        lbf, prob = abf(df.beta.astype(np.float64), df.se.astype(np.float64), W=args.abf_prior_variance)
+        lbf, prob = abf(df.loc[:, args.beta_name].astype(np.float64), df.loc[:, args.se_name].astype(np.float64), W=args.abf_prior_variance)
         cs = get_cs(df.variant, prob, coverage=0.95)
         cs_99 = get_cs(df.variant, prob, coverage=0.99)
         df["lbf"] = lbf
@@ -145,14 +146,14 @@ def main(args):
 
     if args.lead_variant is None:
         if args.lead_variant_choice == "p":
-            lead_idx_snp = df.p.idxmin()
+            lead_idx_snp = df.loc[:, args.p_name].idxmin()
         elif args.lead_variant_choice == "prob":
             lead_idx_snp = df.prob.idxmax()
         elif args.lead_variant_choice in ["gamma", "gamma-p"]:
             lead_idx_snp = df.index[df.gamma]
             if len(lead_idx_snp) == 0:
                 if args.lead_variant_choice == "gamma-p":
-                    lead_idx_snp = df.p.idxmin()
+                    lead_idx_snp = df.loc[:, args.p_name].idxmin()
                 else:
                     raise ValueError("No lead variants found with gamma.")
             elif len(lead_idx_snp) > 1:
@@ -242,8 +243,8 @@ def main(args):
         df["r"] = df["gnomad_lead_r_nfe"]
 
     if args.dentist_s:
-        lead_z = (df.beta / df.se).iloc[lead_idx_snp]
-        df["t_dentist_s"] = ((df.beta / df.se) - df.r * lead_z) ** 2 / (1 - df.r ** 2)
+        lead_z = (df.loc[:, args.beta_name] / df.loc[:, args.se_name]).iloc[lead_idx_snp]
+        df["t_dentist_s"] = ((df.loc[:, args.beta_name] / df.loc[:, args.se_name]) - df.r * lead_z) ** 2 / (1 - df.r ** 2)
         df["t_dentist_s"] = np.where(df["t_dentist_s"] < 0, np.inf, df["t_dentist_s"])
         df["t_dentist_s"].iloc[lead_idx_snp] = np.nan
         df["nlog10p_dentist_s"] = sp.stats.chi2.logsf(df["t_dentist_s"].astype(np.float64), df=1) / -np.log(10)
@@ -259,16 +260,16 @@ def main(args):
     if args.summary:
         df["r2"] = df.r ** 2
         if args.case_control:
-            df["n_eff_samples"] = df.n_samples * (df.n_cases / df.n_samples) * (1 - df.n_cases / df.n_samples)
+            df["n_eff_samples"] = df.loc[:, args.n_samples_name] * (df.loc[:, args.n_cases_name] / df.loc[:, args.n_samples_name]) * (1 - df.loc[:, args.n_cases_name] / df.loc[:, args.n_samples_name])
         else:
-            df["n_eff_samples"] = df.n_samples
+            df["n_eff_samples"] = df.loc[:, args.n_samples_name]
         n_r2 = np.sum(df.r2 > args.r2_threshold)
         n_dentist_s_outlier = np.sum(
             (df.r2 > args.r2_threshold) & (df.nlog10p_dentist_s > args.nlog10p_dentist_s_threshold)
         )
         max_pip_idx = df.prob.idxmax()
         nonsyn_idx = (df.r2 > args.r2_threshold) & df.consequence.isin(["pLoF", "Missense"])
-        variant = df.chromosome.str.cat([df.position.astype(str), df.allele1, df.allele2], sep=":")
+        variant = df.loc[:, args.chromosome_name].str.cat([df.loc[:, args.position_name].astype(str), df.loc[:, args.allele1_name], df.loc[:, args.allele2_name]], sep=":")
         n_eff_r2 = df.n_eff_samples.loc[df.r2 > args.r2_threshold]
         df_summary = pd.DataFrame(
             {
@@ -305,6 +306,22 @@ if __name__ == "__main__":
         choices=["p", "prob", "gamma", "gamma-p"],
         help="Strategy for choosing a lead variant",
     )
+
+    # column name arguments
+    parser.add_argument("--beta_name", type=str, default="beta", help="Column name for beta in summary stat table")
+    parser.add_argument("--se_name", type=str, default="se", help="Column name for se in summary stat table")
+    parser.add_argument("--p_name", type=str, default="p", help="Column name for p in summary stat table")
+    parser.add_argument("--allele1_name", type=str, default="allele1", help="Column name for allele1 in summary stat table")
+    parser.add_argument("--allele2_name", type=str, default="allele2", help="Column name for allele2 in summary stat table")
+    parser.add_argument("--position_name", type=str, default="position", help="Column name for position in summary stat table")
+    parser.add_argument("--n_cases_name", type=str, default="n_cases", help="Column name for n_cases in summary stat table")
+    parser.add_argument("--n_samples_name", type=str, default="n_samples", help="Column name for n_samples in summary stat table")
+    parser.add_argument("--chromosome_name", type=str, default="chromosome", help="Column name for chromosomes in summary stat table")
+
+    
+    # chromosome format option
+    parser.add_argument("--add_chr", action="store_true", help="Whether to add 'chr' to chromosome name")
+
     parser.add_argument("--align-alleles", action="store_true", help="Whether to align alleles with gnomAD")
     parser.add_argument("--annotate-consequence", action="store_true", help="Whether to annotate VEP consequences")
     parser.add_argument("--annotate-gnomad-freq", action="store_true", help="Whether to annotate gnomAD frequencies")
