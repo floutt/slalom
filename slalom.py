@@ -8,13 +8,6 @@ import hail as hl
 from hail.linalg import BlockMatrix
 from hail.utils import new_temp_file
 
-gnomad_latest_versions = {"GRCh37": "2.1.1", "GRCh38": "3.1.2"}
-gnomad_pops = {"GRCh37": ["afr", "amr", "eas", "fin", "nfe"], "GRCh38": ["afr", "amr", "eas", "fin", "nfe", "sas"]}
-gnomad_ld_variant_indices = {
-    "GRCh37": "gs://gcp-public-data--gnomad/release/2.1.1/ld/gnomad.genomes.r2.1.1.{pop}.common.adj.ld.variant_indices.ht",
-    "GRCh38": "gs://finucane-requester-pays/slalom/gnomad/release/2.1.1/ld/gnomad.genomes.r2.1.1.{pop}.common.adj.ld.variant_indices.b38.ht",
-}
-
 
 class ParseKwargs(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
@@ -93,8 +86,6 @@ def get_cs(variant, prob, coverage=0.95):
 def main(args):
     hl._set_flags(no_whole_stage_codegen="1")
     reference_genome = args.reference_genome
-    gnomad_version = gnomad_latest_versions[reference_genome]
-    gnomad_ht_path = f"gs://finucane-requester-pays/slalom/gnomad/release/{gnomad_version}/ht/genomes/gnomad.genomes.r{gnomad_version}.sites.most_severe.ht"
 
     chr_str = hl.str("chr") if args.add_chr else hl.str("")
     ht_snp = hl.import_table(args.snp, impute=True, types={args.chromosome_name: hl.tstr}, delimiter="\s+")
@@ -104,46 +95,34 @@ def main(args):
         ),
         alleles=[ht_snp[args.allele1_name], ht_snp[args.allele2_name]],
     )
-    if args.align_alleles:
-        ht_gnomad = hl.read_table(gnomad_ht_path)
-        ht_snp = align_alleles(ht_snp, ht_gnomad, flip_rows=["beta"])
 
     ht_snp = ht_snp.annotate(variant=hl.variant_str(ht_snp.locus, ht_snp.alleles))
+
+    # annotate LD
+    r2_label = "r2" if not args.export_r else "r"
+    
+    ld_matrix = args.ld_path
+    ld_variant_index = args.ld_variant_index_path
+    ld_label = f"{args.ld_label}_lead_{r2_label}"
+
+    ht = hl.read_table(ld_variant_index)
+
+    # align if necessary
+    if args.align_alleles:
+        ht_snp = align_alleles(ht_snp, ht, flip_rows=["beta"])
+        
     ht_snp = ht_snp.key_by("locus", "alleles")
     ht_snp = ht_snp.add_index("idx_snp")
-
-    # annotate in novel CUPs and reject if using GNOMAD 
-    if(args.ld_reference == "gnomad"):
-        cup = hl.read_table(f"gs://finucane-requester-pays/slalom/cup_files/FASTA_BED.ALL_{reference_genome}.novel_CUPs.ht")
-        reject = hl.read_table(
-            f"gs://finucane-requester-pays/slalom/cup_files/FASTA_BED.ALL_{reference_genome}.reject_2.ht"
-        )
-        ht_snp = ht_snp.annotate(in_cups=hl.is_defined(cup[ht_snp.locus]) | hl.is_defined(reject[ht_snp.locus]))
-
-    # annotate vep and freq
-    if args.annotate_consequence or args.annotate_gnomad_freq:
-        ht_gnomad = hl.read_table(gnomad_ht_path)
-        consequences = ["most_severe", "gene_most_severe", "consequence"] if args.annotate_consequence else []
-        freq_expr = (
-            {f"gnomad_v{gnomad_version[0]}_af_{pop}": ht_gnomad.freq[pop].AF for pop in gnomad_pops[reference_genome]}
-            if args.annotate_gnomad_freq
-            else {}
-        )
-        ht_gnomad = ht_gnomad.select(*consequences, **freq_expr)
-        ht_snp = ht_snp.join(ht_gnomad, how="left")
+    # save checkpoint
     ht_snp = ht_snp.checkpoint(new_temp_file())
-
+    
+    # initialize df
     df = ht_snp.key_by().drop("locus", "alleles", "idx_snp").to_pandas()
 
-    if args.abf:
-        lbf, prob = abf(df.loc[:, args.beta_name].astype(np.float64), df.loc[:, args.se_name].astype(np.float64), W=args.abf_prior_variance)
-        cs = get_cs(df.variant, prob, coverage=0.95)
-        cs_99 = get_cs(df.variant, prob, coverage=0.99)
-        df["lbf"] = lbf
-        df["prob"] = prob
-        df["cs"] = df.variant.isin(cs)
-        df["cs_99"] = df.variant.isin(cs_99)
-
+    ht = ht_snp.join(ht, "inner")
+    ht = ht.checkpoint(new_temp_file())
+    
+    # find lead varuabt
     if args.lead_variant is None:
         if args.lead_variant_choice == "p":
             lead_idx_snp = df.loc[:, args.p_name].idxmin()
@@ -167,80 +146,47 @@ def main(args):
     df["lead_variant"] = False
     df["lead_variant"].iloc[lead_idx_snp] = True
 
-    # annotate LD
-    r2_label = "r2" if not args.export_r else "r"
-    if args.ld_reference == "gnomad":
-        ld_matrices = [
-            f"gs://gcp-public-data--gnomad/release/2.1.1/ld/gnomad.genomes.r2.1.1.{pop}.common.ld.bm"
-            for pop in gnomad_pops["GRCh37"]
-        ]
-        ld_variant_indices = [
-            gnomad_ld_variant_indices[reference_genome].format(pop=pop) for pop in gnomad_pops["GRCh37"]
-        ]
-        ld_labels = [f"gnomad_lead_{r2_label}_{pop}" for pop in gnomad_pops["GRCh37"]]
-    else:
-        ld_matrices = [args.custom_ld_path]
-        ld_variant_indices = [args.custom_ld_variant_index_path]
-        ld_labels = [f"{args.custom_ld_label}_lead_{r2_label}"]
 
-    for ld_bm_path, ld_ht_path, col in zip(ld_matrices, ld_variant_indices, ld_labels):
-        ht = hl.read_table(ld_ht_path)
-        ht = ht_snp.join(ht, "inner")
-        ht = ht.checkpoint(new_temp_file())
+    lead_idx = ht.filter(hl.variant_str(ht.locus, ht.alleles) == args.lead_variant).head(1).idx.collect()
 
-        lead_idx = ht.filter(hl.variant_str(ht.locus, ht.alleles) == args.lead_variant).head(1).idx.collect()
+    if len(lead_idx) == 0:
+        df[ld_label] = np.nan
 
-        if len(lead_idx) == 0:
-            df[col] = np.nan
-            continue
+    idx = ht.idx.collect()
+    idx2 = sorted(list(set(idx)))
 
-        idx = ht.idx.collect()
-        idx2 = sorted(list(set(idx)))
+    bm = BlockMatrix.read(ld_matrix)
+    bm = bm.filter(idx2, idx2)
+    if not np.all(np.diff(idx) > 0):
+        order = np.argsort(idx)
+        rank = np.empty_like(order)
+        _, inv_idx = np.unique(np.sort(idx), return_inverse=True)
+        rank[order] = inv_idx
+        mat = bm.to_numpy()[np.ix_(rank, rank)]
+        bm = BlockMatrix.from_numpy(mat)
 
-        bm = BlockMatrix.read(ld_bm_path)
-        bm = bm.filter(idx2, idx2)
-        if not np.all(np.diff(idx) > 0):
-            order = np.argsort(idx)
-            rank = np.empty_like(order)
-            _, inv_idx = np.unique(np.sort(idx), return_inverse=True)
-            rank[order] = inv_idx
-            mat = bm.to_numpy()[np.ix_(rank, rank)]
-            bm = BlockMatrix.from_numpy(mat)
+    # re-densify triangluar matrix
+    bm = bm + bm.T - get_diag_mat(bm.diagonal())
+    bm = bm.filter_rows(np.where(np.array(idx) == lead_idx[0])[0].tolist())
 
-        # re-densify triangluar matrix
-        bm = bm + bm.T - get_diag_mat(bm.diagonal())
-        bm = bm.filter_rows(np.where(np.array(idx) == lead_idx[0])[0].tolist())
+    idx_snp = ht.idx_snp.collect()
+    r2 = bm.to_numpy()[0]
+    if not args.export_r:
+        r2 = r2 ** 2
 
-        idx_snp = ht.idx_snp.collect()
-        r2 = bm.to_numpy()[0]
-        if not args.export_r:
-            r2 = r2 ** 2
+    df[ld_label] = np.nan
+    df[ld_label].iloc[idx_snp] = r2
 
-        df[col] = np.nan
-        df[col].iloc[idx_snp] = r2
+    df["r"] = df[ld_label]
 
-    if args.weighted_average_r is not None:
-        n_samples = []
-        ld = []
-        for k, v in args.weighted_average_r.items():
-            if isinstance(v, str):
-                if v not in df.columns:
-                    print(f"Column {v} not found.")
-                    continue
-                n_samples.append(df[v].values)
-            else:
-                n_samples.append(np.tile(v, len(df.index)))
-            ld.append(df[f"gnomad_lead_r_{k}"].values)
-        if len(n_samples) == 1:
-            df["r"] = ld[0]
-        else:
-            n_samples = np.array(n_samples).T
-            ld = np.array(ld).T
-            df["r"] = np.nansum(n_samples * ld, axis=1) / np.nansum(n_samples * ~np.isnan(ld), axis=1)
-    elif args.ld_reference == "custom":
-        df["r"] = df[ld_labels[0]]
-    else:
-        df["r"] = df["gnomad_lead_r_nfe"]
+    if args.abf:
+        lbf, prob = abf(df.loc[:, args.beta_name].astype(np.float64), df.loc[:, args.se_name].astype(np.float64), W=args.abf_prior_variance)
+        cs = get_cs(df.variant, prob, coverage=0.95)
+        cs_99 = get_cs(df.variant, prob, coverage=0.99)
+        df["lbf"] = lbf
+        df["prob"] = prob
+        df["cs"] = df.variant.isin(cs)
+        df["cs_99"] = df.variant.isin(cs_99)
 
     if args.dentist_s:
         lead_z = (df.loc[:, args.beta_name] / df.loc[:, args.se_name]).iloc[lead_idx_snp]
@@ -278,14 +224,7 @@ def main(args):
                 "n_r2": [n_r2],
                 "n_dentist_s_outlier": [n_dentist_s_outlier],
                 "fraction": [n_dentist_s_outlier / n_r2 if n_r2 > 0 else 0],
-                "n_nonsyn": [np.sum(nonsyn_idx)],
                 "max_pip": [np.max(df.prob)],
-                "max_pip_nonsyn": [np.max(df.prob.loc[nonsyn_idx])],
-                "cs_nonsyn": [np.any(df.cs.loc[nonsyn_idx])],
-                "cs_99_nonsyn": [np.any(df.cs_99.loc[nonsyn_idx])],
-                "nonsyn_variants": [",".join(variant.loc[nonsyn_idx].values)],
-                "min_neff_r2": [np.nanmin(n_eff_r2) if n_r2 > 0 else np.nan],
-                "max_neff_r2": [np.nanmax(n_eff_r2)] if n_r2 > 0 else np.nan,
             }
         )
         with fopen(args.out_summary, "w") as f:
@@ -323,14 +262,9 @@ if __name__ == "__main__":
     parser.add_argument("--add_chr", action="store_true", help="Whether to add 'chr' to chromosome name")
 
     parser.add_argument("--align-alleles", action="store_true", help="Whether to align alleles with gnomAD")
-    parser.add_argument("--annotate-consequence", action="store_true", help="Whether to annotate VEP consequences")
-    parser.add_argument("--annotate-gnomad-freq", action="store_true", help="Whether to annotate gnomAD frequencies")
-    parser.add_argument(
-        "--ld-reference", type=str, default="gnomad", choices=["gnomad", "custom"], help="Choice of LD reference"
-    )
-    parser.add_argument("--custom-ld-path", type=str, help="Path of user-provided LD BlockMatrix")
-    parser.add_argument("--custom-ld-variant-index-path", type=str, help="Path of user-provided LD variant index table")
-    parser.add_argument("--custom-ld-label", type=str, help="Label of user-provided LD")
+    parser.add_argument("--ld-path", type=str, help="Path of user-provided LD BlockMatrix")
+    parser.add_argument("--ld-variant-index-path", type=str, help="Path of user-provided LD variant index table")
+    parser.add_argument("--ld-label", type=str, help="Label of user-provided LD")
     parser.add_argument("--export-r", action="store_true", help="Export signed r values instead of r2")
     parser.add_argument("--weighted-average-r", type=str, nargs="+", action=ParseKwargs, help="")
     parser.add_argument("--dentist-s", action="store_true", help="Annotate DENTIST-S statistics")
@@ -360,11 +294,10 @@ if __name__ == "__main__":
     if args.out_summary is None:
         args.out_summary = f"{os.path.splitext(args.out)[0]}.summary.txt"
 
-    if args.ld_reference == "custom" and (
-        (args.custom_ld_path is None) or (args.custom_ld_variant_index_path is None) or (args.custom_ld_label is None)
+    if ((args.ld_path is None) or (args.ld_variant_index_path is None) or (args.ld_label is None)
     ):
         raise argparse.ArgumentError(
-            "All of --custom-ld-path, --custom-ld-variant-index-path, and --custom-ld-label should be provided"
+            "All of --ld-path, --ld-variant-index-path, and --ld-label should be provided"
         )
 
     main(args)
