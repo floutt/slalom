@@ -122,7 +122,16 @@ def main(args):
     ht = ht_snp.join(ht, "inner")
     ht = ht.checkpoint(new_temp_file())
     
-    # find lead varuabt
+    if args.abf:
+        lbf, prob = abf(df.loc[:, args.beta_name].astype(np.float64), df.loc[:, args.se_name].astype(np.float64), W=args.abf_prior_variance)
+        cs = get_cs(df.variant, prob, coverage=0.95)
+        cs_99 = get_cs(df.variant, prob, coverage=0.99)
+        df["lbf"] = lbf
+        df["prob"] = prob
+        df["cs"] = df.variant.isin(cs)
+        df["cs_99"] = df.variant.isin(cs_99)
+
+    # find lead variant
     if args.lead_variant is None:
         if args.lead_variant_choice == "p":
             lead_idx_snp = df.loc[:, args.p_name].idxmin()
@@ -178,15 +187,6 @@ def main(args):
     df[ld_label].iloc[idx_snp] = r2
 
     df["r"] = df[ld_label]
-
-    if args.abf:
-        lbf, prob = abf(df.loc[:, args.beta_name].astype(np.float64), df.loc[:, args.se_name].astype(np.float64), W=args.abf_prior_variance)
-        cs = get_cs(df.variant, prob, coverage=0.95)
-        cs_99 = get_cs(df.variant, prob, coverage=0.99)
-        df["lbf"] = lbf
-        df["prob"] = prob
-        df["cs"] = df.variant.isin(cs)
-        df["cs_99"] = df.variant.isin(cs_99)
 
     if args.dentist_s:
         lead_z = (df.loc[:, args.beta_name] / df.loc[:, args.se_name]).iloc[lead_idx_snp]
